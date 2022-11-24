@@ -46,7 +46,7 @@ pub struct KvStore {
     /// 写到了第几个文件
     nth: u64,
     writer: File,
-    oldfiles: HashMap<u64, File>,
+    readers: HashMap<u64, File>,
     indexes: BTreeMap<String, DataIndex>,
     uncompacted: u64,
 }
@@ -66,7 +66,7 @@ impl KvStore {
         
         // read all log files under path, then init them
 
-        let mut oldfiles = HashMap::new();
+        let mut readers = HashMap::new();
         let mut indexes = BTreeMap::new();
         let mut vec: Vec<u64> = Vec::new();
         let mut uncompacted: u64 = 0;
@@ -95,7 +95,7 @@ impl KvStore {
                 indexes.insert(key, data);
             }
             
-            oldfiles.insert(num, f);
+            readers.insert(num, f);
             vec.push(num);
         }
 
@@ -110,7 +110,7 @@ impl KvStore {
             path,
             nth: maxn,
             writer,
-            oldfiles,
+            readers,
             indexes,
             uncompacted
         })
@@ -118,39 +118,43 @@ impl KvStore {
     }
 
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        if let Some(v) = self.indexes.remove(&key) {
-            self.uncompacted += v.len as u64;
-            if let Some(file) = self.oldfiles.get_mut(&v.n) {
-                remove_item(file, v.pos);
-            }
-        }
-
         let mut file = &self.writer;
-        let unixtime = unix_time();
-
         let curpos = file.seek(SeekFrom::Current(0)).unwrap();
         let k = key.as_bytes();
         let v = value.as_bytes();
+        let unixtime = unix_time();
 
-        file.write_u64::<LittleEndian>(unixtime).unwrap();
-        file.write_u64::<LittleEndian>(k.len() as _).unwrap();
-        file.write_u64::<LittleEndian>(v.len() as _).unwrap();
-        file.write_all(k).unwrap();
-        file.write_all(v).unwrap();
+        file.write_all(&unixtime.to_le_bytes()[..])?;
+        file.write_all(&(k.len() as u32).to_le_bytes()[..])?;
+        file.write_all(&(v.len() as u32).to_le_bytes()[..])?;
+        file.write_all(k)?;
+        file.write_all(v)?;
+
+        // file.write_u64::<LittleEndian>(unixtime).unwrap();
+        // file.write_u32::<LittleEndian>(k.len() as _).unwrap();
+        // file.write_u32::<LittleEndian>(v.len() as _).unwrap();
+        // file.write_all(k).unwrap();
+        // file.write_all(v).unwrap();
 
         let len = 128 + (k.len() + v.len()) as u32;
-        self.indexes.insert(key, DataIndex {
-            n: self.nth,
-            pos: curpos,
-            len,
-            timestamp: unixtime
-        });
+        if let Some(v) = self.indexes.insert(key, DataIndex {
+                    n: self.nth,
+                    pos: curpos,
+                    len,
+                    timestamp: unixtime
+                }) 
+        {
+            self.uncompacted += v.len as u64;
+            if let Some(file) = self.readers.get_mut(&v.n) {
+                remove_item(file, v.pos);
+            }
+        }
         Ok(())
     }
 
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         if let Some(vv) = self.indexes.get(&key) {
-            let s = self.oldfiles.get_mut(&vv.n).map(|f| {
+            let s = self.readers.get_mut(&vv.n).map(|f| {
                 f.seek(SeekFrom::Start(vv.pos as _)).unwrap();
                 let mut s = String::with_capacity(vv.len as _);
                 let mut take_reader = f.take(vv.len as _);
@@ -203,4 +207,13 @@ fn open_file(path: &PathBuf, n: u64) -> File {
 
 fn unix_time() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    pub fn test_init() {
+        
+    }
 }
