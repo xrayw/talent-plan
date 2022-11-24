@@ -73,11 +73,18 @@ impl KvStore {
         for e in fs::read_dir(&path)? {
             let e = e?;
             let fpath = e.path();
-            let n = fpath.to_str().unwrap().trim_end_matches(".log");
+
+            let n = fpath.file_name().unwrap()
+                .to_str().unwrap()
+                .trim_end_matches(".log");
             let num: u64 = n.parse().unwrap();
 
             // read key index
-            let mut f = open_file(&path, num);
+            let (mut f, cpath) = open_file(&path, num);
+            if f.metadata().unwrap().len() == 0 {
+                fs::remove_file(cpath).unwrap();
+                continue;
+            }
             loop {
                 let item = read_item(num, &mut f);
                 if item.is_err() {
@@ -104,8 +111,10 @@ impl KvStore {
         if let Some(n) = vec.last() {
             maxn = *n;
         }
+        maxn += 1;
 
-        let writer = open_file(&path, maxn);
+        readers.insert(maxn, open_file(&path, maxn).0);
+        let writer = open_file(&path, maxn).0;
         return Ok(KvStore {
             path,
             nth: maxn,
@@ -129,6 +138,7 @@ impl KvStore {
         file.write_all(&(v.len() as u32).to_le_bytes()[..])?;
         file.write_all(k)?;
         file.write_all(v)?;
+        file.flush().unwrap();
 
         // file.write_u64::<LittleEndian>(unixtime).unwrap();
         // file.write_u32::<LittleEndian>(k.len() as _).unwrap();
@@ -136,13 +146,13 @@ impl KvStore {
         // file.write_all(k).unwrap();
         // file.write_all(v).unwrap();
 
-        let len = 128 + (k.len() + v.len()) as u32;
+        let len = 16 + (k.len() + v.len()) as u32;
         if let Some(v) = self.indexes.insert(key, DataIndex {
-                    n: self.nth,
-                    pos: curpos,
-                    len,
-                    timestamp: unixtime
-                }) 
+            n: self.nth,
+            pos: curpos,
+            len,
+            timestamp: unixtime,
+        })
         {
             self.uncompacted += v.len as u64;
             if let Some(file) = self.readers.get_mut(&v.n) {
@@ -155,9 +165,16 @@ impl KvStore {
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         if let Some(vv) = self.indexes.get(&key) {
             let s = self.readers.get_mut(&vv.n).map(|f| {
-                f.seek(SeekFrom::Start(vv.pos as _)).unwrap();
-                let mut s = String::with_capacity(vv.len as _);
-                let mut take_reader = f.take(vv.len as _);
+                // to vsize start postion
+                f.seek(SeekFrom::Start(vv.pos + 8 + 4)).unwrap();
+                let vsize = f.read_u32::<LittleEndian>().unwrap();
+
+                // to vdata start position
+                let ksize = vv.len - 16 - vsize;
+                f.seek(SeekFrom::Current((ksize) as _)).unwrap();
+
+                let mut s = String::with_capacity(vsize as _);
+                let mut take_reader = f.take(vsize as _);
                 take_reader.read_to_string(&mut s).unwrap();
                 s
             });
@@ -167,7 +184,12 @@ impl KvStore {
     }
 
     pub fn remove(&mut self, key:String) -> Result<()> {
-        todo!()
+        if let Some(v) = self.indexes.remove(&key) {
+            self.uncompacted += v.len as u64;
+            remove_item(self.readers.get_mut(&v.n).unwrap(), v.pos);
+            return Ok(());
+        }
+        Err(KvsError::KeyNotFound)
     }
 }
 
@@ -189,7 +211,7 @@ fn read_item(n: u64, f: &mut File) -> Result<(String, DataIndex)> {
         DataIndex{
             n,
             pos,
-            len: 128 + ksize + vsize,
+            len: 16 + ksize + vsize,
             timestamp
         }
     ))
@@ -201,8 +223,9 @@ fn remove_item(f: &mut File, pos: u64) {
 }
 
 
-fn open_file(path: &PathBuf, n: u64) -> File {
-    OpenOptions::new().read(true).write(true).append(true).create(true).open(&path.join(format!("{}.log", n))).unwrap()
+fn open_file(path: &PathBuf, n: u64) -> (File, PathBuf) {
+    let fpath = path.join(format!("{}.log", n));
+    (OpenOptions::new().read(true).write(true).append(true).create(true).open(&fpath).unwrap(), fpath)
 }
 
 fn unix_time() -> u64 {
@@ -212,8 +235,22 @@ fn unix_time() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use crate::{KvsError, KvStore};
+
     #[test]
     pub fn test_init() {
-        
+        let path= PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let logpath = path.join("target/owntest");
+        let mut kvs = KvStore::open(logpath).unwrap();
+        // let result = kvs.get("hello".to_owned());
+        // assert!(result.is_err());
+
+        kvs.set("yongwei".to_string(), "iewgnoy555678".to_string()).unwrap();
+        let val = kvs.get("yongwei".to_string());
+        let s = val.unwrap().unwrap();
+        println!("{}", s);
+        assert_eq!(s, "iewgnoy555678".to_string());
     }
 }
