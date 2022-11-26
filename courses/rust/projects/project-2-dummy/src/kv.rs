@@ -63,23 +63,24 @@ impl KvStore {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
         fs::create_dir_all(&path)?;
-        
+
         // read all log files under path, then init them
 
         let mut readers = HashMap::new();
         let mut indexes = BTreeMap::new();
         let mut vec: Vec<u64> = Vec::new();
         let mut uncompacted: u64 = 0;
-        for e in fs::read_dir(&path)? {
-            let e = e?;
-            let fpath = e.path();
-
-            let n = fpath.file_name().unwrap()
+        let mut entries: Vec<_> = fs::read_dir(&path)?
+            .flat_map(|v| v.map(|e| e.path()))
+            .flat_map(|v| v.file_name().unwrap()
                 .to_str().unwrap()
-                .trim_end_matches(".log");
-            let num: u64 = n.parse().unwrap();
+                .trim_end_matches(".log")
+                .parse::<u64>()
+            )
+            .collect();
+        entries.sort_unstable();
 
-            // read key index
+        for num in entries {
             let (mut f, cpath) = open_file(&path, num);
             if f.metadata().unwrap().len() == 0 {
                 fs::remove_file(cpath).unwrap();
@@ -88,6 +89,8 @@ impl KvStore {
             loop {
                 let item = read_item(num, &mut f);
                 if item.is_err() {
+                    let err = item.err().unwrap();
+                    println!("{:#?}", err);
                     break;
                 }
 
@@ -99,9 +102,12 @@ impl KvStore {
                     continue;
                 }
 
-                indexes.insert(key, data);
+                if let Some(v) = indexes.insert(key, data) {
+                    remove_item(readers.get_mut(&v.n).unwrap(), v.pos);
+                    uncompacted += v.len as u64;
+                }
             }
-            
+
             readers.insert(num, f);
             vec.push(num);
         }
@@ -123,7 +129,6 @@ impl KvStore {
             indexes,
             uncompacted
         })
-
     }
 
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
@@ -203,8 +208,14 @@ fn read_item(n: u64, f: &mut File) -> Result<(String, DataIndex)> {
     let timestamp: u64 = f.read_u64::<LittleEndian>()?;
     let ksize = f.read_u32::<LittleEndian>()?;
     let vsize = f.read_u32::<LittleEndian>()?;
-    let mut key: Vec<u8> = Vec::with_capacity(ksize as usize);
-    f.read_exact(key.as_mut_slice())?;
+
+    // let mut key: Vec<u8> = Vec::with_capacity(ksize as _);
+    // f.take(ksize as _).read_to_end(&mut key)?;
+
+    let mut key: Vec<u8> = vec![0; ksize as _];
+    f.read_exact(&mut key)?;
+
+    f.seek(SeekFrom::Current(vsize as _)).unwrap();
 
     Ok((
         String::from_utf8(key).unwrap(),
@@ -225,7 +236,7 @@ fn remove_item(f: &mut File, pos: u64) {
 
 fn open_file(path: &PathBuf, n: u64) -> (File, PathBuf) {
     let fpath = path.join(format!("{}.log", n));
-    (OpenOptions::new().read(true).write(true).append(true).create(true).open(&fpath).unwrap(), fpath)
+    (OpenOptions::new().read(true).write(true).create(true).open(&fpath).unwrap(), fpath)
 }
 
 fn unix_time() -> u64 {
@@ -235,7 +246,10 @@ fn unix_time() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write};
     use std::path::PathBuf;
+    use byteorder::{LittleEndian, WriteBytesExt};
 
     use crate::{KvsError, KvStore};
 
@@ -252,5 +266,18 @@ mod tests {
         let s = val.unwrap().unwrap();
         println!("{}", s);
         assert_eq!(s, "iewgnoy555678".to_string());
+    }
+
+    #[test]
+    pub fn test_seek_write() {
+        let path= PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let logpath = path.join("target/owntest");
+
+        let p = logpath.join("tt.log");
+        let mut  file = OpenOptions::new().read(true).write(true).create(true).open(&p).unwrap();
+        file.seek(SeekFrom::Start(0));
+        file.write_u64::<LittleEndian>(1);
+
+        file.flush().unwrap();
     }
 }
