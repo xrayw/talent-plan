@@ -89,8 +89,8 @@ impl KvStore {
             loop {
                 let item = read_item(num, &mut f);
                 if item.is_err() {
-                    let err = item.err().unwrap();
-                    println!("{:#?}", err);
+                    // let err = item.err().unwrap();
+                    // println!("{:#?}", err);
                     break;
                 }
 
@@ -164,6 +164,10 @@ impl KvStore {
                 remove_item(file, v.pos);
             }
         }
+
+        if self.uncompacted >= COMPACTION_THRESHOLD {
+            self.compact();
+        }
         Ok(())
     }
 
@@ -185,7 +189,7 @@ impl KvStore {
             });
             return Ok(s);
         }
-        Err(KvsError::KeyNotFound)
+        Ok(None)
     }
 
     pub fn remove(&mut self, key:String) -> Result<()> {
@@ -196,11 +200,45 @@ impl KvStore {
         }
         Err(KvsError::KeyNotFound)
     }
+
+    pub fn compact(&mut self) {
+        let oldfile_num = self.nth + 1;
+        self.nth += 2;
+
+        let ( mut oldfile, oldfilepath ) = open_file(&self.path, oldfile_num);
+        let mut pos = 0;
+        for v in self.indexes.values_mut() {
+            if let Some(f) = self.readers.get_mut(&v.n) {
+                f.seek(SeekFrom::Start(v.pos)).unwrap();
+                let nwrite = io::copy(&mut f.take(v.len as _), &mut oldfile).unwrap();
+
+                v.n = oldfile_num;
+                v.pos = pos;
+
+                pos += nwrite;
+            }
+        }
+
+        let (mut writer, writerpath) = open_file(&self.path, self.nth);
+
+        let mut readers = HashMap::new();
+        readers.insert(oldfile_num, oldfile);
+        readers.insert(self.nth, writer);
+
+        for (n, _) in &self.readers {
+            fs::remove_file(self.path.join(format!("{}.log", n))).unwrap();
+        }
+
+        self.readers = readers;
+        self.writer = open_file(&self.path, self.nth).0;
+    }
 }
 
 fn fpos(f: &mut File) -> io::Result<u64> {
     f.seek(SeekFrom::Current(0))
 }
+
+// fn read_data(f: &mut File, pos: u64) -> Result<Option<>>
 
 fn read_item(n: u64, f: &mut File) -> Result<(String, DataIndex)> {
     let pos = fpos(f)?;
@@ -274,7 +312,7 @@ mod tests {
         let logpath = path.join("target/owntest");
 
         let p = logpath.join("tt.log");
-        let mut  file = OpenOptions::new().read(true).write(true).create(true).open(&p).unwrap();
+        let mut file = OpenOptions::new().read(true).write(true).create(true).open(&p).unwrap();
         file.seek(SeekFrom::Start(0));
         file.write_u64::<LittleEndian>(1);
 
